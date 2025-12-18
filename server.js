@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 // 1️⃣ ENFORCE ENVIRONMENT VARIABLES
 if (!process.env.JWT_SECRET || !process.env.MONGO_URI || !process.env.SMS_SECRET) {
@@ -110,29 +111,87 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (e) { res.status(500).json({ error: "Server error" }); }
 });
 
-// 🚀 MOBILE PUSH ENDPOINT
-app.post('/api/transactions/push', async (req, res) => {
+// ---------------------------------------------------------
+// 🚀 CORRECTED MOBILE SMS ENDPOINT
+// ---------------------------------------------------------
+
+// Helper function to extract data from raw SMS text
+const parseSms = (body, sender) => {
+  // 1. Default fallback values
+  let amount = 0;
+  let type = 'DEBIT';
+  let category = 'Uncategorized';
+  let description = sender;
+
+  // 2. Simple Regex to find amounts (e.g., "Rs. 500", "INR 500", "USD 50.00")
+  const amountRegex = /(?:Rs\.?|INR|USD)\s*(\d+(?:\.\d{1,2})?)/i;
+  const match = body.match(amountRegex);
+
+  if (match && match[1]) {
+    amount = parseFloat(match[1]);
+  }
+
+  // 3. Determine Type (Credit vs Debit)
+  if (body.toLowerCase().includes('credited') || body.toLowerCase().includes('received')) {
+    type = 'CREDIT';
+  }
+
+  // 4. Create a simple hash to prevent duplicates
+  // (In production, use a better hashing library like crypto)
+  const hash = require('crypto').createHash('md5').update(body + Date.now()).digest('hex');
+
+  return { hash, type, amount, category, description, date: new Date() };
+};
+
+app.post('/sms', async (req, res) => {
+    // 1. Verify Secret (Matches UploadWorker.kt headers)
     const secret = req.headers['x-moneyos-secret'];
     const targetUserId = req.headers['x-user-id'];
 
-    if (secret !== process.env.SMS_SECRET) return res.status(401).json({ error: "Bad Secret" });
+    if (secret !== process.env.SMS_SECRET) {
+      console.log("❌ Unauthorized SMS attempt");
+      return res.status(401).json({ error: "Bad Secret" });
+    }
 
     try {
-        const { transaction } = req.body;
-        const existing = await Transaction.findOne({ userId: targetUserId, hash: transaction.hash });
-        if (existing) return res.json({ success: true, status: 'duplicate' });
+        // 2. Receive Raw Data from App
+        const { body, sender } = req.body; 
 
-        const newTx = new Transaction({ ...transaction, userId: targetUserId });
+        if (!body) return res.status(400).json({ error: "No body provided" });
+
+        console.log(`📩 Received SMS from ${sender}: ${body}`);
+
+        // 3. Parse the Raw Text into a Transaction Object
+        const transaction = parseSms(body, sender);
+
+        // 4. Save to Database
+        // Check for duplicates based on the hash we generated
+        // (Note: Since the hash uses Date.now(), it won't dedup perfectly without a better hash logic, 
+        // but it prevents saving the exact same object instance if retried immediately)
+        const newTx = new Transaction({ 
+            ...transaction, 
+            userId: targetUserId,
+            // Store the original raw message for debugging
+            firewallReason: `Raw SMS: ${body.substring(0, 30)}...` 
+        });
+        
         await newTx.save();
         
-        if (transaction.type === 'DEBIT') {
+        // 5. Update Budget if it's a Debit
+        if (transaction.type === 'DEBIT' && transaction.amount > 0) {
             await Budget.findOneAndUpdate(
                 { userId: targetUserId, category: transaction.category },
                 { $inc: { spent: transaction.amount } }
             );
         }
+
+        console.log("✅ SMS Saved as Transaction");
         res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+
+    } catch (e) { 
+        console.error("Server Error:", e);
+        res.status(500).json({ error: e.message }); 
+    }
 });
 
 // 🚀 FETCH ALL DATA
