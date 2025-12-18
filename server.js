@@ -1,150 +1,219 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
-const http = require('http');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { nanoid } = require('nanoid');
-const { Server } = require('socket.io');
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
-
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET;
-const MONGO_URI = process.env.MONGO_URI;
-
-if (!JWT_SECRET || !MONGO_URI) {
-  console.error('Missing MONGO_URI or JWT_SECRET in .env');
+// 1️⃣ ENFORCE ENVIRONMENT VARIABLES (SECURITY)
+if (!process.env.JWT_SECRET || !process.env.MONGO_URI) {
+  console.error("❌ CRITICAL: Missing required environment variables (JWT_SECRET, MONGO_URI).");
   process.exit(1);
 }
 
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Mongo models
-// Replace existing connect call with this:
-mongoose.connect(MONGO_URI)
-  .then(() => console.log('MongoDB connected'))
-  .catch(err => { console.error('MongoDB connect error', err); process.exit(1); });
+// MongoDB Connection
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('✅ Main API: Connected to MongoDB'))
+  .catch(err => {
+    console.error('❌ MongoDB Connection Error:', err);
+    process.exit(1);
+  });
 
-const DeviceSchema = new mongoose.Schema({
-  name: String,
-  deviceId: String,
-  token: String,
-  createdAt: { type: Date, default: Date.now }
+// --- MODELS ---
+
+const transactionSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    id: String, 
+    hash: { type: String, index: true }, 
+    type: { type: String, enum: ['DEBIT', 'CREDIT'], default: 'DEBIT' },
+    amount: Number,
+    category: String,
+    description: String,
+    // 3️⃣ FIX TRANSACTION DATE TYPE (DATA BUG)
+    date: { type: Date, index: true },
+    firewallDecision: String,
+    firewallReason: String
 });
-const Device = mongoose.model('Device', DeviceSchema);
+transactionSchema.index({ userId: 1, date: -1 });
+const Transaction = mongoose.model('Transaction', transactionSchema);
 
-const MessageSchema = new mongoose.Schema({
-  deviceId: String,
-  from: String,
-  to: String,
-  body: String,
-  source: String,
-  receivedAt: Date,
-  createdAt: { type: Date, default: Date.now }
+const budgetSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    category: String,
+    limit: { type: Number, default: 0 },
+    spent: { type: Number, default: 0 }
 });
-const Message = mongoose.model('Message', MessageSchema);
+const Budget = mongoose.model('Budget', budgetSchema);
 
-// Simple health
-app.get('/', (req, res) => res.send('SMS backend running'));
+const goalSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    id: String,
+    name: String,
+    targetAmount: Number,
+    savedAmount: { type: Number, default: 0 },
+    deadline: String,
+    status: { type: String, default: 'On Track' }
+});
+const Goal = mongoose.model('Goal', goalSchema);
 
-// Device registration -> returns token
-// Body: { name: "My Phone" }
-app.post('/api/devices/register', async (req, res) => {
-  try {
-    const name = (req.body.name || 'unnamed-device').toString().slice(0, 64);
-    const deviceId = nanoid(12);
-    const token = jwt.sign({ deviceId }, JWT_SECRET, { expiresIn: '10y' });
-
-    const device = new Device({ name, deviceId, token });
-    await device.save();
-
-    return res.json({ deviceId, token });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
+const userSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  settings: {
+    monthlyIncome: { type: Number, default: 0 },
+    currentBalance: { type: Number, default: 0 },
+    currency: { type: String, default: 'INR' },
+    recurringExpenses: [{
+        id: String,
+        name: String,
+        amount: Number,
+        date: Number,
+        frequency: String
+    }],
+    onboardingComplete: { type: Boolean, default: false }
   }
 });
+const User = mongoose.model('User', userSchema);
 
-// Auth middleware (expect Bearer <token>)
-async function authMiddleware(req, res, next) {
-  try {
-    const auth = (req.headers.authorization || '').trim();
-    if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'missing_auth' });
-    const token = auth.slice(7);
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.deviceId = payload.deviceId;
-    // optional: verify device exists
-    const device = await Device.findOne({ deviceId: req.deviceId, token }).lean();
-    if (!device) return res.status(401).json({ error: 'invalid_device' });
+// --- AUTH MIDDLEWARE ---
+
+// 1️⃣ FIX AUTHORIZATION HEADER VERIFICATION
+const verifyToken = (req, res, next) => {
+  const auth = req.headers.authorization;
+
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(403).json({ error: "No token provided" });
+  }
+
+  const token = auth.split(' ')[1];
+
+  // 2️⃣ REMOVE JWT SECRET FALLBACK (SECURITY)
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(401).json({ error: "Invalid token" });
+    req.userId = decoded.id;
     next();
-  } catch (e) {
-    return res.status(401).json({ error: 'invalid_token' });
-  }
-}
+  });
+};
 
-// Receive messages from device
-// Body: { from, to, body, source, receivedAt } (receivedAt optional ISO/string)
-app.post('/api/messages', authMiddleware, async (req, res) => {
+// --- ROUTES ---
+
+// Auth: Register
+app.post('/api/auth/register', async (req, res) => {
   try {
-    const { from, to, body, source } = req.body;
-    const receivedAt = req.body.receivedAt ? new Date(req.body.receivedAt) : new Date();
-    const msg = new Message({
-      deviceId: req.deviceId,
-      from: (from || '').toString().slice(0, 64),
-      to: (to || '').toString().slice(0, 64),
-      body: (body || '').toString().slice(0, 2000),
-      source: (source || 'device'),
-      receivedAt
-    });
-    await msg.save();
-
-    // emit socket to all connected clients
-    io.emit('new_message', {
-      id: msg._id,
-      deviceId: msg.deviceId,
-      from: msg.from,
-      to: msg.to,
-      body: msg.body,
-      source: msg.source,
-      receivedAt: msg.receivedAt,
-      createdAt: msg.createdAt
-    });
-
-    return res.status(200).json({ ok: true, id: msg._id });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
+    const { username, password } = req.body;
+    const existingUser = await User.findOne({ username });
+    if (existingUser) return res.status(400).json({ error: "Username already taken" });
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = new User({ username, password: hashedPassword });
+    await newUser.save();
+    res.json({ success: true, message: "User created" });
+  } catch (error) {
+    res.status(500).json({ error: "Registration failed" });
   }
 });
 
-// Basic paginated messages endpoint
-app.get('/api/messages', authMiddleware, async (req, res) => {
+// Auth: Login
+app.post('/api/auth/login', async (req, res) => {
   try {
-    const page = Math.max(0, parseInt(req.query.page || '0'));
-    const limit = Math.min(100, parseInt(req.query.limit || '50'));
-    const docs = await Message.find({ deviceId: req.deviceId })
-      .sort({ receivedAt: -1 })
-      .skip(page * limit)
-      .limit(limit)
-      .lean();
-    return res.json({ messages: docs });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+        return res.status(400).json({ error: "Invalid credentials" });
+    }
+    const token = jwt.sign({ id: user._id, username: user.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ success: true, token, username: user.username });
+  } catch (error) {
+    res.status(500).json({ error: "Login failed" });
   }
 });
 
-// Socket.IO logging
-io.on('connection', socket => {
-  console.log('socket connected', socket.id);
-  socket.on('disconnect', () => console.log('socket disconnected', socket.id));
+// Data: Hydration
+app.get('/api/data', verifyToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.userId);
+        const transactions = await Transaction.find({ userId: req.userId }).sort({ date: -1 }).limit(100);
+        const budgets = await Budget.find({ userId: req.userId });
+        const goals = await Goal.find({ userId: req.userId });
+        res.json({ success: true, settings: user.settings, transactions, budgets, goals });
+    } catch (error) {
+        res.status(500).json({ error: "Fetch failed" });
+    }
 });
 
-server.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
+// Transactions: Create Single
+app.post('/api/transactions', verifyToken, async (req, res) => {
+    try {
+        const { transaction } = req.body;
+        const newTx = new Transaction({ ...transaction, userId: req.userId });
+        await newTx.save();
+        
+        // 4️⃣ REMOVE BUDGET $inc MUTATION (DATA CORRUPTION RISK)
+        // Automatic budget mutations are removed to ensure data integrity.
+        
+        res.json({ success: true, transaction: newTx });
+    } catch (error) {
+        res.status(500).json({ error: "Save failed" });
+    }
 });
+
+// Transactions: Bulk Sync
+app.post('/api/transactions/sync', verifyToken, async (req, res) => {
+    try {
+        const { transactions } = req.body;
+        const ops = transactions.map(tx => ({
+            updateOne: {
+                filter: { userId: req.userId, hash: tx.hash },
+                update: { $setOnInsert: { ...tx, userId: req.userId } },
+                upsert: true
+            }
+        }));
+        const result = await Transaction.bulkWrite(ops);
+        
+        // 4️⃣ REMOVE BUDGET $inc MUTATION (DATA CORRUPTION RISK)
+        // Automatic budget mutations are removed to ensure data integrity.
+
+        res.json({ success: true, added: result.upsertedCount });
+    } catch (error) {
+        res.status(500).json({ error: "Sync failed" });
+    }
+});
+
+// Onboarding
+app.post('/api/onboarding', verifyToken, async (req, res) => {
+    try {
+        const { monthlyIncome, currentBalance, recurringExpenses, initialBudgets } = req.body;
+        const user = await User.findById(req.userId);
+        user.settings = { ...user.settings, monthlyIncome, currentBalance, recurringExpenses, onboardingComplete: true };
+        await user.save();
+        if (initialBudgets) {
+            await Budget.deleteMany({ userId: req.userId });
+            await Budget.insertMany(initialBudgets.map(b => ({ ...b, userId: req.userId })));
+        }
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: "Onboarding failed" });
+    }
+});
+
+// Budgets
+app.post('/api/budgets', verifyToken, async (req, res) => {
+    try {
+        const { budgets } = req.body;
+        for (const b of budgets) {
+            const filter = b._id ? { _id: b._id } : { userId: req.userId, category: b.category };
+            await Budget.findOneAndUpdate(filter, { ...b, userId: req.userId }, { upsert: true });
+        }
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: "Budget update failed" });
+    }
+});
+
+app.listen(PORT, () => console.log(`🚀 Main API running on port ${PORT}`));
