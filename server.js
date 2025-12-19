@@ -47,6 +47,7 @@ const transactionSchema = new mongoose.Schema({
     type: { type: String, enum: ['DEBIT', 'CREDIT'], default: 'DEBIT' },
     amount: Number,
     category: String,
+    sender: String, // Added sender field for history display
     description: String,
     date: { type: Date, default: Date.now },
     firewallDecision: { type: String, default: 'ALLOW' },
@@ -72,6 +73,27 @@ const goalSchema = new mongoose.Schema({
     status: String
 });
 const Goal = mongoose.model('Goal', goalSchema);
+
+// --- CATEGORY INTELLIGENCE ---
+const CATEGORY_KEYWORDS = {
+  'Food': ['ZOMATO', 'SWIGGY', 'DOMINOS', 'PIZZA', 'BURGER', 'KFC', 'MCDONALD', 'STARBUCKS'],
+  'Transport': ['UBER', 'OLA', 'RAPIDO', 'IRCTC', 'METRO', 'FUEL', 'PETROL', 'SHELL', 'BPCL'],
+  'Shopping': ['AMAZON', 'FLIPKART', 'MYNTRA', 'AJIO', 'ZARA', 'H&M', 'RELIANCE', 'TATA'],
+  'Grocery': ['BLINKIT', 'ZEPTO', 'BIGBASKET', 'DMART', 'GROFERS', 'NATURES'],
+  'Utilities': ['JIO', 'AIRTEL', 'VI', 'BSNL', 'ACT', 'BESCOM', 'POWER', 'GAS'],
+  'Bank': ['HDFC', 'ICICI', 'SBI', 'AXIS', 'KOTAK', 'PNB', 'BOB', 'PAYTM', 'GPAY', 'PHONEPE']
+};
+
+const detectCategory = (sender, body) => {
+  const text = (sender + " " + body).toUpperCase();
+  
+  for (const [category, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
+    if (keywords.some(keyword => text.includes(keyword))) {
+      return category;
+    }
+  }
+  return 'Uncategorized';
+};
 
 // --- AUTH MIDDLEWARE ---
 
@@ -112,39 +134,34 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ---------------------------------------------------------
-// 🚀 CORRECTED MOBILE SMS ENDPOINT
+// 🚀 MOBILE SMS ENDPOINT (UPDATED)
 // ---------------------------------------------------------
 
-// Helper function to extract data from raw SMS text
 const parseSms = (body, sender) => {
-  // 1. Default fallback values
   let amount = 0;
   let type = 'DEBIT';
-  let category = 'Uncategorized';
   let description = sender;
 
-  // 2. Simple Regex to find amounts (e.g., "Rs. 500", "INR 500", "USD 50.00")
+  // 1. Amount Regex
   const amountRegex = /(?:Rs\.?|INR|USD)\s*(\d+(?:\.\d{1,2})?)/i;
   const match = body.match(amountRegex);
+  if (match && match[1]) amount = parseFloat(match[1]);
 
-  if (match && match[1]) {
-    amount = parseFloat(match[1]);
-  }
-
-  // 3. Determine Type (Credit vs Debit)
+  // 2. Type Detection
   if (body.toLowerCase().includes('credited') || body.toLowerCase().includes('received')) {
     type = 'CREDIT';
   }
 
-  // 4. Create a simple hash to prevent duplicates
-  // (In production, use a better hashing library like crypto)
-  const hash = require('crypto').createHash('md5').update(body + Date.now()).digest('hex');
+  // 3. Smart Category Detection
+  const category = detectCategory(sender, body);
+
+  // 4. Stable Hash (Sender + Body ensures duplicates are caught even if retried later)
+  const hash = crypto.createHash('md5').update(sender + body).digest('hex');
 
   return { hash, type, amount, category, description, date: new Date() };
 };
 
 app.post('/sms', async (req, res) => {
-    // 1. Verify Secret (Matches UploadWorker.kt headers)
     const secret = req.headers['x-moneyos-secret'];
     const targetUserId = req.headers['x-user-id'];
 
@@ -154,30 +171,29 @@ app.post('/sms', async (req, res) => {
     }
 
     try {
-        // 2. Receive Raw Data from App
         const { body, sender } = req.body; 
-
         if (!body) return res.status(400).json({ error: "No body provided" });
 
         console.log(`📩 Received SMS from ${sender}: ${body}`);
 
-        // 3. Parse the Raw Text into a Transaction Object
         const transaction = parseSms(body, sender);
 
-        // 4. Save to Database
-        // Check for duplicates based on the hash we generated
-        // (Note: Since the hash uses Date.now(), it won't dedup perfectly without a better hash logic, 
-        // but it prevents saving the exact same object instance if retried immediately)
+        // Check for duplicates
+        const existing = await Transaction.findOne({ userId: targetUserId, hash: transaction.hash });
+        if (existing) {
+            console.log("⚠️ Duplicate SMS ignored.");
+            return res.json({ success: true, status: 'duplicate' });
+        }
+
         const newTx = new Transaction({ 
             ...transaction, 
             userId: targetUserId,
-            // Store the original raw message for debugging
+            sender: sender, // Save sender for history UI
             firewallReason: `Raw SMS: ${body.substring(0, 30)}...` 
         });
         
         await newTx.save();
         
-        // 5. Update Budget if it's a Debit
         if (transaction.type === 'DEBIT' && transaction.amount > 0) {
             await Budget.findOneAndUpdate(
                 { userId: targetUserId, category: transaction.category },
@@ -185,12 +201,31 @@ app.post('/sms', async (req, res) => {
             );
         }
 
-        console.log("✅ SMS Saved as Transaction");
+        console.log(`✅ Transaction saved: ${transaction.category} - ${transaction.amount}`);
         res.json({ success: true });
 
     } catch (e) { 
         console.error("Server Error:", e);
         res.status(500).json({ error: e.message }); 
+    }
+});
+
+// 🚀 NEW ENDPOINT: FETCH RECENT SMS HISTORY
+app.get('/sms/recent', async (req, res) => {
+    const secret = req.headers['x-moneyos-secret'];
+    const targetUserId = req.headers['x-user-id'];
+
+    if (secret !== process.env.SMS_SECRET) return res.status(401).json({ error: "Bad Secret" });
+
+    try {
+        const transactions = await Transaction.find({ userId: targetUserId })
+            .sort({ date: -1 })
+            .limit(20)
+            .select('hash sender amount category type date'); // Select only needed fields
+            
+        res.json({ success: true, transactions });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     }
 });
 
@@ -218,7 +253,7 @@ app.post('/api/onboarding', verifyToken, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🚀 CRUD Operations (Simplified for brevity but fully functional)
+// 🚀 CRUD Operations
 app.post('/api/transactions', verifyToken, async (req, res) => {
     const tx = new Transaction({ ...req.body.transaction, userId: req.userId });
     await tx.save();
