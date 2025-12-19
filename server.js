@@ -289,5 +289,7 @@ app.post('/api/user/settings', verifyToken, async (req, res) => {
     await User.findByIdAndUpdate(req.userId, { 'settings.monthlyIncome': req.body.monthlyIncome, 'settings.recurringExpenses': req.body.recurringExpenses });
     res.json({ success: true });
 });
+// 🚀 HEALTH CHECK
+app.get('/health', (req, res) => res.status(200).send('OK'));
 
 app.listen(PORT, () => console.log(`🚀 MoneyOS Core API live on port ${PORT}`));
