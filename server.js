@@ -47,7 +47,7 @@ const transactionSchema = new mongoose.Schema({
     type: { type: String, enum: ['DEBIT', 'CREDIT'], default: 'DEBIT' },
     amount: Number,
     category: String,
-    sender: String, // Added sender field for history display
+    sender: String, 
     description: String,
     date: { type: Date, default: Date.now },
     firewallDecision: { type: String, default: 'ALLOW' },
@@ -74,8 +74,17 @@ const goalSchema = new mongoose.Schema({
 });
 const Goal = mongoose.model('Goal', goalSchema);
 
+// 🆕 NEW MODEL: DYNAMIC CATEGORY RULES
+const ruleSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    keyword: { type: String, required: true }, // e.g., "BIGBASKET"
+    category: { type: String, required: true } // e.g., "Grocery"
+});
+const CategoryRule = mongoose.model('CategoryRule', ruleSchema);
+
 // --- CATEGORY INTELLIGENCE ---
-const CATEGORY_KEYWORDS = {
+
+const DEFAULT_KEYWORDS = {
   'Food': ['ZOMATO', 'SWIGGY', 'DOMINOS', 'PIZZA', 'BURGER', 'KFC', 'MCDONALD', 'STARBUCKS'],
   'Transport': ['UBER', 'OLA', 'RAPIDO', 'IRCTC', 'METRO', 'FUEL', 'PETROL', 'SHELL', 'BPCL'],
   'Shopping': ['AMAZON', 'FLIPKART', 'MYNTRA', 'AJIO', 'ZARA', 'H&M', 'RELIANCE', 'TATA'],
@@ -84,10 +93,19 @@ const CATEGORY_KEYWORDS = {
   'Bank': ['HDFC', 'ICICI', 'SBI', 'AXIS', 'KOTAK', 'PNB', 'BOB', 'PAYTM', 'GPAY', 'PHONEPE']
 };
 
-const detectCategory = (sender, body) => {
+// 🧠 UPDATED DETECTOR: Checks DB Rules FIRST, then Defaults
+const detectCategory = (sender, body, dbRules = []) => {
   const text = (sender + " " + body).toUpperCase();
   
-  for (const [category, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
+  // 1. Check Custom DB Rules (High Priority)
+  for (const rule of dbRules) {
+    if (text.includes(rule.keyword.toUpperCase())) {
+      return rule.category;
+    }
+  }
+
+  // 2. Check Default Hardcoded Rules (Fallback)
+  for (const [category, keywords] of Object.entries(DEFAULT_KEYWORDS)) {
     if (keywords.some(keyword => text.includes(keyword))) {
       return category;
     }
@@ -134,28 +152,40 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ---------------------------------------------------------
-// 🚀 MOBILE SMS ENDPOINT (UPDATED)
+// 🚀 MOBILE SMS ENDPOINT (UPDATED WITH DB RULES)
 // ---------------------------------------------------------
 
-const parseSms = (body, sender) => {
+const parseSms = (body, sender, dbRules) => {
   let amount = 0;
   let type = 'DEBIT';
   let description = sender;
 
-  // 1. Amount Regex
-  const amountRegex = /(?:Rs\.?|INR|USD)\s*(\d+(?:\.\d{1,2})?)/i;
-  const match = body.match(amountRegex);
-  if (match && match[1]) amount = parseFloat(match[1]);
+  // 1. CLEANUP
+  const cleanBody = body.replace(/,/g, '');
 
-  // 2. Type Detection
+  // 2. STRATEGY A: Strict Currency Symbols
+  const currencyRegex = /(?:Rs\.?|INR|USD|₹)\s*(\d+(?:\.\d{1,2})?)/i;
+  let match = cleanBody.match(currencyRegex);
+
+  // 3. STRATEGY B: Fallback Keywords (paid, spent)
+  if (!match) {
+    const keywordRegex = /(?:paid|spent|sent|debited|charged)\s+(\d+(?:\.\d{1,2})?)/i;
+    match = cleanBody.match(keywordRegex);
+  }
+
+  if (match && match[1]) {
+    amount = parseFloat(match[1]);
+  }
+
+  // 4. Type Detection
   if (body.toLowerCase().includes('credited') || body.toLowerCase().includes('received')) {
     type = 'CREDIT';
   }
 
-  // 3. Smart Category Detection
-  const category = detectCategory(sender, body);
+  // 5. Smart Category Detection (Passing DB Rules)
+  const category = detectCategory(sender, body, dbRules);
 
-  // 4. Stable Hash (Sender + Body ensures duplicates are caught even if retried later)
+  // 6. Generate Hash
   const hash = crypto.createHash('md5').update(sender + body).digest('hex');
 
   return { hash, type, amount, category, description, date: new Date() };
@@ -165,30 +195,27 @@ app.post('/sms', async (req, res) => {
     const secret = req.headers['x-moneyos-secret'];
     const targetUserId = req.headers['x-user-id'];
 
-    if (secret !== process.env.SMS_SECRET) {
-      console.log("❌ Unauthorized SMS attempt");
-      return res.status(401).json({ error: "Bad Secret" });
-    }
+    if (secret !== process.env.SMS_SECRET) return res.status(401).json({ error: "Bad Secret" });
 
     try {
         const { body, sender } = req.body; 
         if (!body) return res.status(400).json({ error: "No body provided" });
 
+        // 🆕 FETCH USER RULES FROM DB
+        const dbRules = await CategoryRule.find({ userId: targetUserId });
+
         console.log(`📩 Received SMS from ${sender}: ${body}`);
 
-        const transaction = parseSms(body, sender);
+        // PASS RULES TO PARSER
+        const transaction = parseSms(body, sender, dbRules);
 
-        // Check for duplicates
         const existing = await Transaction.findOne({ userId: targetUserId, hash: transaction.hash });
-        if (existing) {
-            console.log("⚠️ Duplicate SMS ignored.");
-            return res.json({ success: true, status: 'duplicate' });
-        }
+        if (existing) return res.json({ success: true, status: 'duplicate' });
 
         const newTx = new Transaction({ 
             ...transaction, 
             userId: targetUserId,
-            sender: sender, // Save sender for history UI
+            sender: sender, 
             firewallReason: `Raw SMS: ${body.substring(0, 30)}...` 
         });
         
@@ -210,23 +237,43 @@ app.post('/sms', async (req, res) => {
     }
 });
 
-// 🚀 NEW ENDPOINT: FETCH RECENT SMS HISTORY
+// 🆕 RULES MANAGEMENT API (FOR FRONTEND)
+app.get('/api/rules', verifyToken, async (req, res) => {
+    try {
+        const rules = await CategoryRule.find({ userId: req.userId });
+        res.json({ success: true, rules });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/rules', verifyToken, async (req, res) => {
+    try {
+        const { keyword, category } = req.body;
+        const newRule = new CategoryRule({ userId: req.userId, keyword, category });
+        await newRule.save();
+        res.json({ success: true, rule: newRule });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/rules/:id', verifyToken, async (req, res) => {
+    try {
+        await CategoryRule.findByIdAndDelete(req.params.id);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🚀 RECENT HISTORY
 app.get('/sms/recent', async (req, res) => {
     const secret = req.headers['x-moneyos-secret'];
     const targetUserId = req.headers['x-user-id'];
-
     if (secret !== process.env.SMS_SECRET) return res.status(401).json({ error: "Bad Secret" });
 
     try {
         const transactions = await Transaction.find({ userId: targetUserId })
             .sort({ date: -1 })
             .limit(20)
-            .select('hash sender amount category type date'); // Select only needed fields
-            
+            .select('hash sender amount category type date');
         res.json({ success: true, transactions });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 🚀 FETCH ALL DATA
@@ -253,13 +300,11 @@ app.post('/api/onboarding', verifyToken, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🚀 CRUD Operations
+// 🚀 CRUD
 app.post('/api/transactions', verifyToken, async (req, res) => {
     const tx = new Transaction({ ...req.body.transaction, userId: req.userId });
     await tx.save();
-    if (tx.type === 'DEBIT') {
-        await Budget.findOneAndUpdate({ userId: req.userId, category: tx.category }, { $inc: { spent: tx.amount } });
-    }
+    if (tx.type === 'DEBIT') await Budget.findOneAndUpdate({ userId: req.userId, category: tx.category }, { $inc: { spent: tx.amount } });
     res.json({ success: true });
 });
 
@@ -289,6 +334,7 @@ app.post('/api/user/settings', verifyToken, async (req, res) => {
     await User.findByIdAndUpdate(req.userId, { 'settings.monthlyIncome': req.body.monthlyIncome, 'settings.recurringExpenses': req.body.recurringExpenses });
     res.json({ success: true });
 });
+
 // 🚀 HEALTH CHECK
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
