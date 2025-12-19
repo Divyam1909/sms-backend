@@ -82,15 +82,17 @@ const ruleSchema = new mongoose.Schema({
 });
 const CategoryRule = mongoose.model('CategoryRule', ruleSchema);
 
-// --- CATEGORY INTELLIGENCE ---
+// --- CATEGORY INTELLIGENCE (FIXED: MATCHING FRONTEND NAMES) ---
 
 const DEFAULT_KEYWORDS = {
-  'Food': ['ZOMATO', 'SWIGGY', 'DOMINOS', 'PIZZA', 'BURGER', 'KFC', 'MCDONALD', 'STARBUCKS'],
-  'Transport': ['UBER', 'OLA', 'RAPIDO', 'IRCTC', 'METRO', 'FUEL', 'PETROL', 'SHELL', 'BPCL'],
-  'Shopping': ['AMAZON', 'FLIPKART', 'MYNTRA', 'AJIO', 'ZARA', 'H&M', 'RELIANCE', 'TATA'],
-  'Grocery': ['BLINKIT', 'ZEPTO', 'BIGBASKET', 'DMART', 'GROFERS', 'NATURES'],
-  'Utilities': ['JIO', 'AIRTEL', 'VI', 'BSNL', 'ACT', 'BESCOM', 'POWER', 'GAS'],
-  'Bank': ['HDFC', 'ICICI', 'SBI', 'AXIS', 'KOTAK', 'PNB', 'BOB', 'PAYTM', 'GPAY', 'PHONEPE']
+  'Food & Dining': ['ZOMATO', 'SWIGGY', 'DOMINOS', 'PIZZA', 'BURGER', 'KFC', 'MCDONALD', 'STARBUCKS', 'CAFE', 'DINING', 'RESTAURANT', 'FOOD'],
+  'Transportation': ['UBER', 'OLA', 'RAPIDO', 'IRCTC', 'METRO', 'FUEL', 'PETROL', 'SHELL', 'BPCL', 'PUMP', 'TOLL', 'PARKING'],
+  'Shopping': ['AMAZON', 'FLIPKART', 'MYNTRA', 'AJIO', 'ZARA', 'H&M', 'RELIANCE', 'TATA', 'MALL', 'RETAIL', 'STORE'],
+  'Grocery': ['BLINKIT', 'ZEPTO', 'BIGBASKET', 'DMART', 'GROFERS', 'NATURES', 'MART', 'SUPERMARKET'],
+  'Utilities': ['JIO', 'AIRTEL', 'VI', 'BSNL', 'ACT', 'BESCOM', 'POWER', 'GAS', 'WATER', 'BILL', 'RECHARGE'],
+  'Entertainment': ['NETFLIX', 'SPOTIFY', 'PRIME', 'MOVIE', 'CINEMA', 'BOOKMYSHOW', 'PLAYSTATION', 'STEAM', 'GAME'],
+  'Health': ['PHARMACY', 'MEDICAL', 'APOLLO', 'DOCTOR', 'HOSPITAL', 'MEDPLUS', '1MG'],
+  'Travel': ['MAKEMYTRIP', 'GOIBIBO', 'FLIGHT', 'HOTEL', 'AIRBNB', 'INDIGO']
 };
 
 // 🧠 UPDATED DETECTOR: Checks DB Rules FIRST, then Defaults
@@ -221,6 +223,7 @@ app.post('/sms', async (req, res) => {
         
         await newTx.save();
         
+        // 🛠️ UPDATE BUDGET SPENT AUTOMATICALLY
         if (transaction.type === 'DEBIT' && transaction.amount > 0) {
             await Budget.findOneAndUpdate(
                 { userId: targetUserId, category: transaction.category },
@@ -317,6 +320,14 @@ app.post('/api/budgets', verifyToken, async (req, res) => {
         );
     }
     res.json({ success: true });
+});
+
+// 🆕 DELETE BUDGET (FIXED: This was missing!)
+app.delete('/api/budgets/:id', verifyToken, async (req, res) => {
+    try {
+        await Budget.findByIdAndDelete(req.params.id);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/goals', verifyToken, async (req, res) => {
