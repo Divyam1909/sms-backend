@@ -211,8 +211,33 @@ app.post('/sms', async (req, res) => {
         // PASS RULES TO PARSER
         const transaction = parseSms(body, sender, dbRules);
 
-        const existing = await Transaction.findOne({ userId: targetUserId, hash: transaction.hash });
-        if (existing) return res.json({ success: true, status: 'duplicate' });
+        // 🛑 NEW CHECK: Ignore 0 value transactions
+        if (transaction.amount === 0) {
+            console.log(`⏩ Skipped 0-value transaction from ${sender}`);
+            return res.json({ success: true, status: 'skipped_zero' });
+        }
+
+        // 2. CHECK EXACT DUPLICATE (Existing Hash Check)
+        const existingHash = await Transaction.findOne({ userId: targetUserId, hash: transaction.hash });
+        if (existingHash) return res.json({ success: true, status: 'duplicate_hash' });
+
+        // ---------------------------------------------------------
+        // 🚀 3. NEW: SMART TIME-WINDOW DE-DUPLICATION
+        // ---------------------------------------------------------
+        // Look for a transaction with the SAME Amount and Type recorded in the last 2 MINUTES
+        const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
+        const recentDuplicate = await Transaction.findOne({
+            userId: targetUserId,
+            amount: transaction.amount,
+            type: transaction.type,
+            date: { $gte: twoMinutesAgo }
+        });
+
+        if (recentDuplicate) {
+            console.log(`🛡️ Smart Firewall: Blocked duplicate notification for ₹${transaction.amount} from ${sender}`);
+            return res.json({ success: true, status: 'duplicate_smart_time_window' });
+        }
+        // ---------------------------------------------------------
 
         const newTx = new Transaction({ 
             ...transaction, 
@@ -305,6 +330,10 @@ app.post('/api/onboarding', verifyToken, async (req, res) => {
 
 // 🚀 CRUD
 app.post('/api/transactions', verifyToken, async (req, res) => {
+      // 🛑 NEW CHECK
+      if (Number(req.body.transaction.amount) === 0) {
+        return res.json({ success: true, status: 'skipped_zero' });
+    }
     const tx = new Transaction({ ...req.body.transaction, userId: req.userId });
     await tx.save();
     if (tx.type === 'DEBIT') await Budget.findOneAndUpdate({ userId: req.userId, category: tx.category }, { $inc: { spent: tx.amount } });
